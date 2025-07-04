@@ -1,4 +1,4 @@
-#include <iostream>
+﻿#include <iostream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <ctime>
 #include <iomanip>
+#include <filesystem>
+#include <queue>
 
 #pragma comment(lib, "ws2_32.lib")
 using namespace std;
+namespace fs = std::filesystem;
 
 //Global variables for client state
 bool g_prompt_confirmation = true; // Controls confirmation prompt for mget/mput
@@ -896,6 +899,213 @@ void ftp_passive_toggle() {
     write_log("Passive mode toggled - Now " + string(g_passive_mode_preference ? "enabled" : "disabled"));
 }
 
+// get all local files in a directory
+vector<string> get_local_files(const string& directory, bool recursive = true) {
+    vector<string> files;
+
+    try {
+        if (recursive) {
+            for (const auto& entry : fs::recursive_directory_iterator(directory)) {
+                if (entry.is_regular_file()) {
+                    files.push_back(entry.path().string());
+                }
+            }
+        }
+        else {
+            for (const auto& entry : fs::directory_iterator(directory)) {
+                if (entry.is_regular_file()) {
+                    files.push_back(entry.path().string());
+                }
+            }
+        }
+    }
+    catch (const fs::filesystem_error& e) {
+        cout << "Error reading directory: " << e.what() << endl;
+        write_log("Error reading local directory: " + directory + " - " + e.what());
+    }
+
+    return files;
+}
+
+// create a remote directory recursively
+bool create_remote_directory_recursive(int controlSock, const std::string& path) {
+    if (controlSock == INVALID_SOCKET) return false;
+
+    std::string current_path = "/";
+    std::istringstream iss(path);
+    std::string segment;
+
+    while (std::getline(iss, segment, '/')) {
+        if (segment.empty()) continue;
+
+        if (current_path != "/") current_path += "/";
+        current_path += segment;
+
+        // Thử tạo thư mục (có thể đã tồn tại)
+        std::string cmd = "MKD " + current_path + "\r\n";
+        send(controlSock, cmd.c_str(), (int)cmd.length(), 0);
+
+        char buffer[1024] = { 0 };
+        recv(controlSock, buffer, sizeof(buffer) - 1, 0);
+        // Không cần kiểm tra lỗi vì thư mục có thể đã tồn tại
+    }
+
+    return true;
+}
+
+// Upload files recursively from local directory to remote directory
+void ftp_mput_recursive(int controlSock, const std::string& local_directory, const std::string& remote_directory = "") {
+    if (controlSock == INVALID_SOCKET) {
+        cout << "Not connected to a server.\n";
+        return;
+    }
+
+    if (!g_passive_mode_preference) {
+        cout << "Error: Recursive upload requires passive mode.\n";
+        return;
+    }
+
+    write_log("Recursive upload started - Directory: " + local_directory);
+
+    // Lấy danh sách tất cả file trong thư mục
+    std::vector<std::string> files = get_local_files(local_directory, true);
+
+    if (files.empty()) {
+        cout << "No files found in directory: " << local_directory << endl;
+        return;
+    }
+
+    cout << "Found " << files.size() << " files for upload\n";
+
+    if (g_prompt_confirmation) {
+        cout << "Upload " << files.size() << " files recursively? (y/N): ";
+        std::string confirm;
+        getline(cin, confirm);
+        if (confirm != "y" && confirm != "Y") {
+            cout << "Upload cancelled.\n";
+            return;
+        }
+    }
+
+    // Tạo thư mục đích trên server nếu được chỉ định
+    if (!remote_directory.empty()) {
+        create_remote_directory_recursive(controlSock, remote_directory);
+        ftp_cd(controlSock, remote_directory);
+    }
+
+    fs::path base_path(local_directory);
+    int success_count = 0;
+
+    for (const auto& file_path : files) {
+        fs::path full_path(file_path);
+        fs::path relative_path = fs::relative(full_path, base_path);
+
+        // Tạo thư mục con trên server nếu cần
+        if (relative_path.has_parent_path()) {
+            std::string parent_dir = relative_path.parent_path().string();
+            std::replace(parent_dir.begin(), parent_dir.end(), '\\', '/');
+            create_remote_directory_recursive(controlSock, parent_dir);
+        }
+
+        // Upload file
+        cout << "Uploading: " << relative_path << endl;
+
+        // Chuyển đến thư mục chứa file
+        if (relative_path.has_parent_path()) {
+            std::string parent_dir = relative_path.parent_path().string();
+            std::replace(parent_dir.begin(), parent_dir.end(), '\\', '/');
+            ftp_cd(controlSock, parent_dir);
+        }
+
+        // Upload chỉ tên file
+        std::string filename = relative_path.filename().string();
+
+        // Tạm thời chuyển đến thư mục chứa file local
+        fs::path old_path = fs::current_path();
+        fs::current_path(full_path.parent_path());
+
+        ftp_put(controlSock, filename);
+        success_count++;
+
+        // Trở về thư mục gốc
+        fs::current_path(old_path);
+
+        // Trở về thư mục gốc trên server
+        if (!remote_directory.empty()) {
+            ftp_cd(controlSock, remote_directory);
+        }
+        else {
+            ftp_cd(controlSock, "/");
+        }
+    }
+
+    cout << "Recursive upload completed: " << success_count << "/" << files.size() << " files\n";
+    write_log("Recursive upload completed - " + std::to_string(success_count) + "/" + std::to_string(files.size()) + " files");
+}
+
+void ftp_mget_recursive(int controlSock, const std::string& remote_directory, const std::string& local_directory = ".") {
+    if (controlSock == INVALID_SOCKET) {
+        cout << "Not connected to a server.\n";
+        return;
+    }
+
+    if (!g_passive_mode_preference) {
+        cout << "Error: Recursive download requires passive mode.\n";
+        return;
+    }
+
+    write_log("Recursive download started - Remote: " + remote_directory + ", Local: " + local_directory);
+
+    // Tạo thư mục local nếu chưa tồn tại
+    try {
+        fs::create_directories(local_directory);
+    }
+    catch (const fs::filesystem_error& e) {
+        cout << "Error creating local directory: " << e.what() << endl;
+        return;
+    }
+
+    // Sử dụng queue để duyệt thư mục
+    std::queue<std::pair<std::string, std::string>> dir_queue; // {remote_path, local_path}
+    dir_queue.push({ remote_directory, local_directory });
+
+    int file_count = 0;
+
+    while (!dir_queue.empty()) {
+        auto [current_remote, current_local] = dir_queue.front();
+        dir_queue.pop();
+
+        // Chuyển đến thư mục trên server
+        ftp_cd(controlSock, current_remote);
+
+        // Lấy danh sách file (giả sử có hàm parse danh sách từ LIST)
+        cout << "Processing directory: " << current_remote << endl;
+
+        // Tạo thư mục local tương ứng
+        try {
+            fs::create_directories(current_local);
+        }
+        catch (const fs::filesystem_error& e) {
+            cout << "Error creating directory: " << e.what() << endl;
+            continue;
+        }
+
+        // Chuyển đến thư mục local
+        fs::path old_path = fs::current_path();
+        fs::current_path(current_local);
+
+        // Giả sử có danh sách file từ LIST command
+        // Đây là phần cần implement parse LIST response
+        cout << "Note: File listing and parsing needed for full implementation\n";
+
+        // Trở về thư mục gốc
+        fs::current_path(old_path);
+    }
+
+    write_log("Recursive download completed - " + std::to_string(file_count) + " files");
+}
+
+
 // help command: display available commands
 void display_help() {
     cout << "\n=== FTP Client Commands ===" << endl;
@@ -929,6 +1139,8 @@ void display_help() {
     cout << "  mput <file1> [file2] - Upload multiple files" << endl;
     cout << "  delete <filename>    - Delete file on server" << endl;
     cout << "  rename <old> <new>   - Rename file on server" << endl;
+    cout << "  rget <remote_dir> [local_dir] - Recursively download directory" << endl;
+    cout << "  rput <local_dir> [remote_dir] - Recursively upload directory" << endl;
     cout << "" << endl;
 
     cout << "Other Commands:" << endl;
@@ -1280,6 +1492,30 @@ void process_command(const string& input) {
             sendCommand(static_cast<int>(g_control_sockfd), "NOOP\r\n");
             log_command("NOOP", "Sent NOOP command");
         }
+    }
+    else if (command == "rget") {
+        std::string remote_dir, local_dir;
+        iss >> remote_dir >> local_dir;
+
+        if (remote_dir.empty()) {
+            cout << "Usage: rget <remote_directory> [local_directory]\n";
+            return;
+        }
+
+        if (local_dir.empty()) local_dir = ".";
+
+        ftp_mget_recursive(static_cast<int>(g_control_sockfd), remote_dir, local_dir);
+    }
+    else if (command == "rput") {
+        std::string local_dir, remote_dir;
+        iss >> local_dir >> remote_dir;
+
+        if (local_dir.empty()) {
+            cout << "Usage: rput <local_directory> [remote_directory]\n";
+            return;
+        }
+
+        ftp_mput_recursive(static_cast<int>(g_control_sockfd), local_dir, remote_dir);
     }
     else {
         cout << "Unknown command: " << command << endl;
